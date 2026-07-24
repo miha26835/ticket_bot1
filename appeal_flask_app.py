@@ -1,12 +1,12 @@
 from flask import Flask, request
 from appeal_bot import bot, dp, main
-import asyncio, threading
+import asyncio
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return 'Бот обжалований запущен!'
+    return '⚖️ Бот для обжалований работает!'
 
 @app.route('/webhook', methods=['POST'])
 async def webhook():
@@ -18,5 +18,7 @@ def run_bot():
     asyncio.run(main())
 
 if __name__ == '__main__':
-    threading.Thread(target=run_bot).start()
-    app.run()
+    import threading
+    bot_thread = threading.Thread(target=run_bot)
+    bot_thread.start()
+    app.run(host='0.0.0.0', port=8080)
