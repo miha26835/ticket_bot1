@@ -1,22 +1,23 @@
 from flask import Flask, request
-from main_bot import bot, dp, main
-import asyncio, threading
+import asyncio
+from main_bot import main as bot_main
 
 app = Flask(__name__)
 
 @app.route('/')
-def home():
+def hello_world():
     return 'Тикет-бот запущен!'
 
 @app.route('/webhook', methods=['POST'])
 async def webhook():
-    update = request.get_json()
-    await dp.process_update(update)
+    # Для webhook нужно будет переделать, но пока оставим заглушку
     return 'OK', 200
 
 def run_bot():
-    asyncio.run(main())
+    asyncio.run(bot_main())
 
 if __name__ == '__main__':
-    threading.Thread(target=run_bot).start()
-    app.run()
+    import threading
+    bot_thread = threading.Thread(target=run_bot)
+    bot_thread.start()
+    app.run(host='0.0.0.0', port=8080)
