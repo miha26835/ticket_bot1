@@ -1,96 +1,115 @@
 import asyncio
 import logging
-from aiogram import Bot, Dispatcher, types
-from aiogram.contrib.middlewares.logging import LoggingMiddleware
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ConversationHandler
 from appeal_config import BOT_TOKEN, MODERATION_CHAT_ID, MODERATORS
 from appeal_db import init_db, save_appeal, update_appeal_status, get_appeal
 
 logging.basicConfig(level=logging.INFO)
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
-dp.middleware.setup(LoggingMiddleware())
 
-user_data = {}
+# Состояния для разговора
+NICK, REASON = range(2)
 
-@dp.message_handler(commands=['start'])
-async def start_appeal(message: types.Message):
-    user_data[message.from_user.id] = {}
-    await message.answer(
-        "⚖️ <b>Обжалование решений</b>\n\n1️⃣ Ваш ник\n2️⃣ Причина обжалования\n\n⏱️ Ответ: 3-12 часов\n\nНапиши ник:",
-        parse_mode="HTML"
+async def start_appeal(update: Update, context):
+    await update.message.reply_text(
+        "⚖️ Бот для обжалования решений администраторов\n\n"
+        "Если вы не согласны с решением модератора, вы можете подать апелляцию.\n\n"
+        "1️⃣ Ваш ник\n"
+        "2️⃣ Причина обжалования\n\n"
+        "⏱️ Среднее время ответа: 3-12 часов\n\n"
+        "Напишите ваш игровой ник:"
     )
-    user_data[message.from_user.id]['step'] = 'nick'
+    return NICK
 
-@dp.message_handler(lambda msg: user_data.get(msg.from_user.id, {}).get('step') == 'nick')
-async def get_appeal_nick(message: types.Message):
-    user_data[message.from_user.id]['nick'] = message.text.strip()
-    user_data[message.from_user.id]['step'] = 'reason'
-    await message.answer("📝 Напиши причину обжалования:", parse_mode="HTML")
+async def get_appeal_nick(update: Update, context):
+    context.user_data['nick'] = update.message.text
+    await update.message.reply_text("📝 Напишите причину обжалования:")
+    return REASON
 
-@dp.message_handler(lambda msg: user_data.get(msg.from_user.id, {}).get('step') == 'reason')
-async def get_appeal_reason(message: types.Message):
-    data = user_data[message.from_user.id]
+async def get_appeal_reason(update: Update, context):
+    data = context.user_data
     appeal_text = (
-        f"👤 <b>Ник:</b> {data['nick']}\n"
-        f"⚖️ <b>Обжалование:</b> {message.text.strip()}\n"
-        f"📩 <b>Отправил:</b> @{message.from_user.username or 'нет юзера'}"
+        f"👤 Ник: {data['nick']}\n"
+        f"⚖️ Обжалование: {update.message.text}\n"
+        f"📩 Отправил: @{update.effective_user.username or 'нет юзера'}"
     )
+    
     appeal_id = await save_appeal(
-        user_id=message.from_user.id,
-        username=message.from_user.username or "без_юзера",
+        user_id=update.effective_user.id,
+        username=update.effective_user.username or "без_юзера",
         appeal_text=appeal_text
     )
 
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("✅ Принять", callback_data=f"appeal_accept_{appeal_id}"),
-        InlineKeyboardButton("❌ Отклонить", callback_data=f"appeal_reject_{appeal_id}")
-    )
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Принять", callback_data=f"appeal_accept_{appeal_id}"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"appeal_reject_{appeal_id}")
+        ]
+    ])
 
-    await bot.send_message(
+    await context.bot.send_message(
         chat_id=MODERATION_CHAT_ID,
-        text=f"🔔 <b>Новая апелляция #{appeal_id}</b>\n\n{appeal_text}",
-        parse_mode="HTML",
+        text=f"🔔 Новая апелляция #{appeal_id}\n\n{appeal_text}",
         reply_markup=keyboard
     )
 
-    await message.answer(f"✅ Апелляция #{appeal_id} принята! Ответ 3-12 часов.", parse_mode="HTML")
-    del user_data[message.from_user.id]
+    await update.message.reply_text(
+        f"✅ Апелляция #{appeal_id} принята!\n"
+        "Модераторы рассмотрят её в ближайшее время.\n"
+        "⏱️ Среднее время ответа: 3-12 часов."
+    )
+    return ConversationHandler.END
 
-@dp.callback_query_handler(lambda cb: cb.data.startswith('appeal_accept_') or cb.data.startswith('appeal_reject_'))
-async def handle_appeal(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
+async def handle_appeal(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
     if user_id not in MODERATORS:
-        await callback_query.answer("⛔ Нет прав!", show_alert=True)
+        await query.edit_message_text("⛔ Нет прав!")
         return
 
-    action, _, appeal_id_str = callback_query.data.partition('_')
+    action, _, appeal_id_str = query.data.partition('_')
     appeal_id = int(appeal_id_str)
     appeal_info = await get_appeal(appeal_id)
     if not appeal_info:
-        await callback_query.answer("❌ Апелляция не найдена!", show_alert=True)
+        await query.edit_message_text("❌ Апелляция не найдена!")
         return
 
     user_id, _ = appeal_info
     status = "accepted" if action == "accept" else "rejected"
     await update_appeal_status(appeal_id, status)
 
-    await callback_query.message.edit_reply_markup(reply_markup=None)
     status_text = "✅ ПРИНЯТА" if action == "accept" else "❌ ОТКЛОНЕНА"
-    await callback_query.message.edit_text(
-        f"{callback_query.message.text}\n\n<b>Статус:</b> {status_text}",
-        parse_mode="HTML"
+    await query.edit_message_text(
+        f"{query.message.text}\n\nСтатус: {status_text}"
     )
 
     msg = "✅ Принята! Будет пересмотрено." if action == "accept" else "❌ Отклонена. Оснований нет."
-    await bot.send_message(user_id, f"<b>Апелляция #{appeal_id}</b>\n{msg}", parse_mode="HTML")
-    await callback_query.answer(f"✅ #{appeal_id} {status_text}")
+    await context.bot.send_message(user_id, f"Апелляция #{appeal_id}\n{msg}")
 
-async def main():
-    await init_db()
+async def cancel(update: Update, context):
+    await update.message.reply_text("Операция отменена.")
+    return ConversationHandler.END
+
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start_appeal)],
+        states={
+            NICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_appeal_nick)],
+            REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_appeal_reason)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+
+    app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(handle_appeal, pattern='^(appeal_accept_|appeal_reject_)'))
+
+    asyncio.run(init_db())
     print("🤖 Бот обжалований запущен!")
-    await dp.start_polling()
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
