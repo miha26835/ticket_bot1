@@ -1,114 +1,121 @@
 import asyncio
 import logging
-from aiogram import Bot, Dispatcher, types
-from aiogram.contrib.middlewares.logging import LoggingMiddleware
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ConversationHandler
 from main_config import BOT_TOKEN, MODERATION_CHAT_ID, MODERATORS
 from main_db import init_db, save_ticket, update_ticket_status, get_ticket
 
 logging.basicConfig(level=logging.INFO)
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
-dp.middleware.setup(LoggingMiddleware())
 
-user_data = {}
+# Состояния для ConversationHandler
+NICK, VIOLATION, PROOF = range(3)
 
-@dp.message_handler(commands=['start'])
-async def start_command(message: types.Message):
-    user_data[message.from_user.id] = {}
-    await message.answer(
-        "🛡️ <b>Добро пожаловать в систему тикетов!</b>\n\n"
-        "1️⃣ Ник нарушителя\n2️⃣ Что он делал\n3️⃣ Запись нарушения\n\nНапиши ник:",
-        parse_mode="HTML"
+async def start(update: Update, context):
+    await update.message.reply_text(
+        "🛡️ Добро пожаловать в систему тикетов!\n\n"
+        "1️⃣ Ник нарушителя\n2️⃣ Что он делал\n3️⃣ Запись нарушения\n\nНапиши ник:"
     )
-    user_data[message.from_user.id]['step'] = 'nick'
+    return NICK
 
-@dp.message_handler(lambda msg: user_data.get(msg.from_user.id, {}).get('step') == 'nick')
-async def get_nick(message: types.Message):
-    user_data[message.from_user.id]['nick'] = message.text.strip()
-    user_data[message.from_user.id]['step'] = 'violation'
-    await message.answer("📝 Опиши нарушение:", parse_mode="HTML")
+async def get_nick(update: Update, context):
+    context.user_data['nick'] = update.message.text
+    await update.message.reply_text("📝 Опиши нарушение:")
+    return VIOLATION
 
-@dp.message_handler(lambda msg: user_data.get(msg.from_user.id, {}).get('step') == 'violation')
-async def get_violation(message: types.Message):
-    user_data[message.from_user.id]['violation'] = message.text.strip()
-    user_data[message.from_user.id]['step'] = 'proof'
-    await message.answer("📎 Пришли доказательство:", parse_mode="HTML")
+async def get_violation(update: Update, context):
+    context.user_data['violation'] = update.message.text
+    await update.message.reply_text("📎 Пришли доказательство:")
+    return PROOF
 
-@dp.message_handler(lambda msg: user_data.get(msg.from_user.id, {}).get('step') == 'proof', content_types=types.ContentTypes.ANY)
-async def get_proof(message: types.Message):
-    data = user_data[message.from_user.id]
+async def get_proof(update: Update, context):
+    data = context.user_data
     proof = "Файл/медиа"
-    if message.photo:
-        proof = f"Фото: {message.photo[-1].file_id}"
-    elif message.video:
-        proof = f"Видео: {message.video.file_id}"
-    elif message.document:
-        proof = f"Файл: {message.document.file_id}"
-    elif message.text:
-        proof = message.text
+    if update.message.photo:
+        proof = f"Фото: {update.message.photo[-1].file_id}"
+    elif update.message.video:
+        proof = f"Видео: {update.message.video.file_id}"
+    elif update.message.document:
+        proof = f"Файл: {update.message.document.file_id}"
+    elif update.message.text:
+        proof = update.message.text
 
     ticket_text = (
-        f"👤 <b>Нарушитель:</b> {data['nick']}\n"
-        f"⚡ <b>Нарушение:</b> {data['violation']}\n"
-        f"📎 <b>Доказательство:</b> {proof}\n"
-        f"📩 <b>Отправил:</b> @{message.from_user.username or 'нет юзера'}"
+        f"👤 Нарушитель: {data['nick']}\n"
+        f"⚡ Нарушение: {data['violation']}\n"
+        f"📎 Доказательство: {proof}\n"
+        f"📩 Отправил: @{update.effective_user.username or 'нет юзера'}"
     )
     ticket_id = await save_ticket(
-        user_id=message.from_user.id,
-        username=message.from_user.username or "без_юзера",
+        user_id=update.effective_user.id,
+        username=update.effective_user.username or "без_юзера",
         ticket_text=ticket_text
     )
 
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("✅ Принять", callback_data=f"accept_{ticket_id}"),
-        InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{ticket_id}")
-    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Принять", callback_data=f"accept_{ticket_id}"),
+         InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{ticket_id}")]
+    ])
 
-    await bot.send_message(
+    await context.bot.send_message(
         chat_id=MODERATION_CHAT_ID,
-        text=f"🔔 <b>Новый тикет #{ticket_id}</b>\n\n{ticket_text}",
-        parse_mode="HTML",
+        text=f"🔔 Новый тикет #{ticket_id}\n\n{ticket_text}",
         reply_markup=keyboard
     )
 
-    await message.answer(f"✅ Тикет #{ticket_id} принят! Модераторы рассмотрят.", parse_mode="HTML")
-    del user_data[message.from_user.id]
+    await update.message.reply_text(f"✅ Тикет #{ticket_id} принят! Модераторы рассмотрят.")
+    return ConversationHandler.END
 
-@dp.callback_query_handler(lambda cb: cb.data.startswith('accept_') or cb.data.startswith('reject_'))
-async def handle_moderation(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
+async def handle_moderation(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
     if user_id not in MODERATORS:
-        await callback_query.answer("⛔ Нет прав!", show_alert=True)
+        await query.edit_message_text("⛔ Нет прав!")
         return
 
-    action, ticket_id_str = callback_query.data.split('_')
+    action, ticket_id_str = query.data.split('_')
     ticket_id = int(ticket_id_str)
     ticket_info = await get_ticket(ticket_id)
     if not ticket_info:
-        await callback_query.answer("❌ Тикет не найден!", show_alert=True)
+        await query.edit_message_text("❌ Тикет не найден!")
         return
 
     user_id, _ = ticket_info
     status = "accepted" if action == "accept" else "rejected"
     await update_ticket_status(ticket_id, status)
 
-    await callback_query.message.edit_reply_markup(reply_markup=None)
     status_text = "✅ ПРИНЯТ" if action == "accept" else "❌ ОТКЛОНЁН"
-    await callback_query.message.edit_text(
-        f"{callback_query.message.text}\n\n<b>Статус:</b> {status_text}",
-        parse_mode="HTML"
+    await query.edit_message_text(
+        f"{query.message.text}\n\nСтатус: {status_text}"
     )
 
     msg = "✅ Принят! Игрок получит наказание." if action == "accept" else "❌ Отклонён. Недостаточно доказательств."
-    await bot.send_message(user_id, f"<b>Тикет #{ticket_id}</b>\n{msg}", parse_mode="HTML")
-    await callback_query.answer(f"✅ #{ticket_id} {status_text}")
+    await context.bot.send_message(user_id, f"Тикет #{ticket_id}\n{msg}")
 
-async def main():
-    await init_db()
+async def cancel(update: Update, context):
+    await update.message.reply_text("Операция отменена.")
+    return ConversationHandler.END
+
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={
+            NICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_nick)],
+            VIOLATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_violation)],
+            PROOF: [MessageHandler(filters.ALL, get_proof)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+
+    app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(handle_moderation, pattern='^(accept_|reject_)'))
+
+    asyncio.run(init_db())
     print("🤖 Основной бот запущен!")
-    await dp.start_polling()
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
