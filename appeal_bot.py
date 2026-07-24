@@ -1,42 +1,36 @@
-import asyncio, logging
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+import asyncio
+import logging
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.middlewares.logging import LoggingMiddleware
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from appeal_config import BOT_TOKEN, MODERATION_CHAT_ID, MODERATORS
 from appeal_db import init_db, save_appeal, update_appeal_status, get_appeal
-from appeal_keyboards import get_appeal_keyboard
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+dp = Dispatcher(bot)
+dp.middleware.setup(LoggingMiddleware())
 
-class AppealStates(StatesGroup):
-    waiting_for_nick = State()
-    waiting_for_reason = State()
+user_data = {}
 
-@dp.message(Command("start"))
-async def start_command(message: types.Message, state: FSMContext):
-    await state.clear()
+@dp.message_handler(commands=['start'])
+async def start_appeal(message: types.Message):
+    user_data[message.from_user.id] = {}
     await message.answer(
-        "⚖️ <b>Обжалование решений</b>\n\n"
-        "1️⃣ Ваш ник\n2️⃣ Причина обжалования\n\n"
-        "⏱️ Ответ: 3-12 часов\n\nНапишите ваш ник:",
+        "⚖️ <b>Обжалование решений</b>\n\n1️⃣ Ваш ник\n2️⃣ Причина обжалования\n\n⏱️ Ответ: 3-12 часов\n\nНапиши ник:",
         parse_mode="HTML"
     )
-    await state.set_state(AppealStates.waiting_for_nick)
+    user_data[message.from_user.id]['step'] = 'nick'
 
-@dp.message(AppealStates.waiting_for_nick)
-async def get_nick(message: types.Message, state: FSMContext):
-    await state.update_data(nick=message.text.strip())
-    await message.answer("📝 Напишите причину обжалования:", parse_mode="HTML")
-    await state.set_state(AppealStates.waiting_for_reason)
+@dp.message_handler(lambda msg: user_data.get(msg.from_user.id, {}).get('step') == 'nick')
+async def get_appeal_nick(message: types.Message):
+    user_data[message.from_user.id]['nick'] = message.text.strip()
+    user_data[message.from_user.id]['step'] = 'reason'
+    await message.answer("📝 Напиши причину обжалования:", parse_mode="HTML")
 
-@dp.message(AppealStates.waiting_for_reason)
-async def get_reason(message: types.Message, state: FSMContext):
-    data = await state.get_data()
+@dp.message_handler(lambda msg: user_data.get(msg.from_user.id, {}).get('step') == 'reason')
+async def get_appeal_reason(message: types.Message):
+    data = user_data[message.from_user.id]
     appeal_text = (
         f"👤 <b>Ник:</b> {data['nick']}\n"
         f"⚖️ <b>Обжалование:</b> {message.text.strip()}\n"
@@ -47,46 +41,56 @@ async def get_reason(message: types.Message, state: FSMContext):
         username=message.from_user.username or "без_юзера",
         appeal_text=appeal_text
     )
+
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("✅ Принять", callback_data=f"appeal_accept_{appeal_id}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"appeal_reject_{appeal_id}")
+    )
+
     await bot.send_message(
         chat_id=MODERATION_CHAT_ID,
         text=f"🔔 <b>Новая апелляция #{appeal_id}</b>\n\n{appeal_text}",
         parse_mode="HTML",
-        reply_markup=get_appeal_keyboard(appeal_id)
+        reply_markup=keyboard
     )
-    await message.answer(
-        f"✅ Апелляция #{appeal_id} принята! Ответ 3-12 часов.",
-        parse_mode="HTML"
-    )
-    await state.clear()
 
-@dp.callback_query(F.data.startswith("appeal_accept_") | F.data.startswith("appeal_reject_"))
-async def handle_appeal(callback: types.CallbackQuery):
-    if callback.from_user.id not in MODERATORS:
-        await callback.answer("⛔ Нет прав!", show_alert=True)
+    await message.answer(f"✅ Апелляция #{appeal_id} принята! Ответ 3-12 часов.", parse_mode="HTML")
+    del user_data[message.from_user.id]
+
+@dp.callback_query_handler(lambda cb: cb.data.startswith('appeal_accept_') or cb.data.startswith('appeal_reject_'))
+async def handle_appeal(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    if user_id not in MODERATORS:
+        await callback_query.answer("⛔ Нет прав!", show_alert=True)
         return
-    action, _, appeal_id_str = callback.data.partition("_")
+
+    action, _, appeal_id_str = callback_query.data.partition('_')
     appeal_id = int(appeal_id_str)
     appeal_info = await get_appeal(appeal_id)
     if not appeal_info:
-        await callback.answer("❌ Апелляция не найдена!", show_alert=True)
+        await callback_query.answer("❌ Апелляция не найдена!", show_alert=True)
         return
+
     user_id, _ = appeal_info
     status = "accepted" if action == "accept" else "rejected"
     await update_appeal_status(appeal_id, status)
-    await callback.message.edit_reply_markup(reply_markup=None)
+
+    await callback_query.message.edit_reply_markup(reply_markup=None)
     status_text = "✅ ПРИНЯТА" if action == "accept" else "❌ ОТКЛОНЕНА"
-    await callback.message.edit_text(
-        f"{callback.message.text}\n\n<b>Статус:</b> {status_text}",
+    await callback_query.message.edit_text(
+        f"{callback_query.message.text}\n\n<b>Статус:</b> {status_text}",
         parse_mode="HTML"
     )
+
     msg = "✅ Принята! Будет пересмотрено." if action == "accept" else "❌ Отклонена. Оснований нет."
     await bot.send_message(user_id, f"<b>Апелляция #{appeal_id}</b>\n{msg}", parse_mode="HTML")
-    await callback.answer(f"✅ #{appeal_id} {status_text}")
+    await callback_query.answer(f"✅ #{appeal_id} {status_text}")
 
 async def main():
     await init_db()
     print("🤖 Бот обжалований запущен!")
-    await dp.start_polling(bot)
+    await dp.start_polling()
 
 if __name__ == "__main__":
     asyncio.run(main())
